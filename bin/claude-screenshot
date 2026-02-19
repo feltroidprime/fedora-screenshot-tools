@@ -56,7 +56,7 @@ send_to_claude() {
 send_to_device() {
     local device="$1"
     local dest_dir="~/Downloads/$LOCAL_HOSTNAME"
-    local filename="${LOCAL_HOSTNAME}_$(date +%d_%m_%y_%H_%M_%S).png"
+    local filename="${LOCAL_HOSTNAME}_$(date +%Y-%m-%d_%Hh%Mm%S).png"
 
     notify-send -i dialog-information "Claude Screenshot" "Sending to $device..."
 
