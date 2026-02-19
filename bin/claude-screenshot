@@ -56,22 +56,24 @@ send_to_claude() {
 send_to_device() {
     local device="$1"
     local dest_dir="~/Downloads/$LOCAL_HOSTNAME"
+    local filename="${LOCAL_HOSTNAME}_$(date +%d_%m_%y_%H_%M_%S).png"
 
     notify-send -i dialog-information "Claude Screenshot" "Sending to $device..."
 
-    if ssh "$device" "mkdir -p $dest_dir" && scp -q "$TMPFILE" "$device:$dest_dir/"; then
-        notify-send -i dialog-information "Claude Screenshot" "Sent to $device:$dest_dir/"
+    if ssh "$device" "mkdir -p $dest_dir" && scp -q "$TMPFILE" "$device:$dest_dir/$filename"; then
+        notify-send -i dialog-information "Claude Screenshot" "Sent to $device:$dest_dir/$filename"
     else
         die "Failed to send to $device"
     fi
 }
 
 get_tailscale_peers() {
-    # Returns active peer hostnames, one per line
+    # Returns all reachable peer hostnames (excludes offline and self)
     tailscale status 2>/dev/null \
         | grep -v "^$" \
         | grep -v "^#" \
-        | awk '$5 == "active;" || $5 == "active" {print $2}' \
+        | grep -v "offline" \
+        | awk '{print $2}' \
         | grep -v "^${LOCAL_HOSTNAME}$" \
         || true
 }
