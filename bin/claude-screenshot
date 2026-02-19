@@ -1,120 +1,145 @@
 #!/bin/bash
-# claude-screenshot - Capture d'écran → Claude Code ou envoi Tailscale
-# Flux : Impr Ecran (capture normale) → Ctrl+Shift+Impr Ecran (action)
-# Usage: claude-screenshot [--quick "prompt"] [--send DEVICE]
+# claude-screenshot - Screenshot → Claude Code OCR or Tailscale send
+# Requires: GNOME/Wayland, wl-paste, zenity, notify-send
+# Optional: claude CLI, tailscale, ssh/scp
+#
+# Usage:
+#   claude-screenshot                    Interactive dialog
+#   claude-screenshot --quick ["prompt"] Send to Claude with default/custom prompt
+#   claude-screenshot --send DEVICE      Send to Tailscale device
 
 set -euo pipefail
 
-export PATH="$HOME/.claude/local:$PATH"
+# Ensure claude CLI is reachable (not in PATH when launched from GNOME)
+[[ -d "$HOME/.claude/local" ]] && export PATH="$HOME/.claude/local:$PATH"
 
 DEFAULT_PROMPT="Extract all text from this image"
-HOSTNAME=$(hostname)
+LOCAL_HOSTNAME=$(hostname)
 
-# 1. Récupérer l'image depuis le presse-papiers
-TMPFILE="/tmp/claude-screenshot-$$.png"
+die() { notify-send -i dialog-error "Claude Screenshot" "$1"; exit 1; }
 
-if ! wl-paste --type image/png > "$TMPFILE" 2>/dev/null || [[ ! -s "$TMPFILE" ]]; then
-    rm -f "$TMPFILE"
-    notify-send -i dialog-error "Claude Screenshot" "Pas d'image dans le presse-papiers.\nFais d'abord une capture avec Impr Écran."
-    exit 0
-fi
+# --- Grab image from clipboard ---
 
+TMPFILE=$(mktemp /tmp/claude-screenshot-XXXXXX.png)
 cleanup() { rm -f "$TMPFILE"; }
 trap cleanup EXIT
 
-# 2. Mode CLI direct
-if [[ "${1:-}" == "--quick" ]]; then
-    PROMPT="${2:-$DEFAULT_PROMPT}"
-    # Aller directement à Claude
-    notify-send -i dialog-information "Claude Screenshot" "Traitement en cours..."
-    RESPONSE=$(echo "Read image '$TMPFILE'. Output ONLY raw text, no commentary. Task: $PROMPT" \
+if ! wl-paste --type image/png > "$TMPFILE" 2>/dev/null || [[ ! -s "$TMPFILE" ]]; then
+    die "No image in clipboard.\nTake a screenshot with Print Screen first."
+fi
+
+# --- Helpers ---
+
+send_to_claude() {
+    local prompt="${1:-$DEFAULT_PROMPT}"
+    notify-send -i dialog-information "Claude Screenshot" "Processing..."
+
+    if ! command -v claude &>/dev/null; then
+        die "claude CLI not found"
+    fi
+
+    local response
+    response=$(echo "Read image '$TMPFILE'. Output ONLY raw text, no commentary. Task: $prompt" \
         | claude -p --model haiku --allowedTools "Read" --add-dir /tmp 2>&1) || true
-    if [[ -n "$RESPONSE" ]]; then
-        echo -n "$RESPONSE" | wl-copy
-        zenity --text-info \
-            --title="Claude Screenshot - Résultat (copié)" \
-            --width=700 --height=500 --font="monospace" \
-            <<< "$RESPONSE" 2>/dev/null || true
-    else
-        notify-send -i dialog-error "Claude Screenshot" "Pas de réponse"
+
+    if [[ -z "$response" ]]; then
+        die "No response from Claude"
     fi
-    exit 0
+
+    echo -n "$response" | wl-copy
+    zenity --text-info \
+        --title="Claude Screenshot (copied to clipboard)" \
+        --width=700 --height=500 --font="monospace" \
+        <<< "$response" 2>/dev/null || true
+}
+
+send_to_device() {
+    local device="$1"
+    local dest_dir="~/Downloads/$LOCAL_HOSTNAME"
+
+    notify-send -i dialog-information "Claude Screenshot" "Sending to $device..."
+
+    if ssh "$device" "mkdir -p $dest_dir" && scp -q "$TMPFILE" "$device:$dest_dir/"; then
+        notify-send -i dialog-information "Claude Screenshot" "Sent to $device:$dest_dir/"
+    else
+        die "Failed to send to $device"
+    fi
+}
+
+get_tailscale_peers() {
+    # Returns active peer hostnames, one per line
+    tailscale status 2>/dev/null \
+        | grep -v "^$" \
+        | grep -v "^#" \
+        | awk '$5 == "active;" || $5 == "active" {print $2}' \
+        | grep -v "^${LOCAL_HOSTNAME}$" \
+        || true
+}
+
+# --- CLI modes ---
+
+case "${1:-}" in
+    --quick)
+        send_to_claude "${2:-$DEFAULT_PROMPT}"
+        exit 0
+        ;;
+    --send)
+        [[ -z "${2:-}" ]] && die "Usage: claude-screenshot --send DEVICE"
+        send_to_device "$2"
+        exit 0
+        ;;
+    --help|-h)
+        echo "Usage: claude-screenshot [--quick [prompt]] [--send DEVICE]"
+        echo ""
+        echo "  (no args)        Interactive dialog with Claude + Tailscale options"
+        echo "  --quick [prompt] Send to Claude directly (default: extract text)"
+        echo "  --send DEVICE    Send screenshot to Tailscale device via scp"
+        exit 0
+        ;;
+esac
+
+# --- Interactive mode ---
+
+ZENITY_ITEMS=()
+
+# Claude option (only if CLI available)
+if command -v claude &>/dev/null; then
+    ZENITY_ITEMS+=("claude" "Send to Claude Code (AI)")
 fi
 
-if [[ "${1:-}" == "--send" ]]; then
-    DEVICE="${2:-macbook}"
-    DEST="$DEVICE:~/Downloads/$HOSTNAME/"
-    ssh "$DEVICE" "mkdir -p ~/Downloads/$HOSTNAME" && scp "$TMPFILE" "$DEST"
-    if [[ $? -eq 0 ]]; then
-        notify-send -i dialog-information "Claude Screenshot" "Envoyé à $DEVICE"
-    else
-        notify-send -i dialog-error "Claude Screenshot" "Échec envoi à $DEVICE"
-    fi
-    exit 0
+# Tailscale peers (only if tailscale available)
+PEERS=$(get_tailscale_peers)
+if [[ -n "$PEERS" ]]; then
+    while IFS= read -r peer; do
+        ZENITY_ITEMS+=("send:$peer" "Send to $peer (~/$LOCAL_HOSTNAME/)")
+    done <<< "$PEERS"
 fi
 
-# 3. Dialog interactif : choisir l'action
-# Lister les appareils Tailscale connectés
-TAILSCALE_PEERS=$(tailscale status 2>/dev/null | grep -v "$HOSTNAME" | grep 'active' | awk '{print $2}' || true)
-
-# Construire la liste zenity : Claude + chaque peer Tailscale
-ZENITY_ITEMS=("claude" "Envoyer à Claude Code")
-for PEER in $TAILSCALE_PEERS; do
-    ZENITY_ITEMS+=("send:$PEER" "Envoyer à $PEER (~/Downloads/$HOSTNAME/)")
-done
+if [[ ${#ZENITY_ITEMS[@]} -eq 0 ]]; then
+    die "No actions available.\nInstall claude CLI or tailscale."
+fi
 
 ACTION=$(zenity --list \
     --title="Claude Screenshot" \
-    --text="Que faire avec cette capture ?" \
+    --text="What to do with this screenshot?" \
     --column="Action" --column="Description" \
     "${ZENITY_ITEMS[@]}" \
     --width=500 --height=400 \
     --hide-column=1 \
     2>/dev/null) || true
 
-if [[ -z "$ACTION" ]]; then
-    notify-send -i dialog-information "Claude Screenshot" "Annulé"
-    exit 0
-fi
+[[ -z "$ACTION" ]] && exit 0
 
-# 4. Exécuter l'action
-if [[ "$ACTION" == "claude" ]]; then
-    # Demander le prompt
-    PROMPT=$(zenity --entry \
-        --title="Claude Screenshot" \
-        --text="Prompt :" \
-        --entry-text="$DEFAULT_PROMPT" \
-        --width=500 2>/dev/null) || true
-
-    PROMPT="${PROMPT:-$DEFAULT_PROMPT}"
-
-    notify-send -i dialog-information "Claude Screenshot" "Traitement en cours..."
-
-    RESPONSE=$(echo "Read image '$TMPFILE'. Output ONLY raw text, no commentary. Task: $PROMPT" \
-        | claude -p --model haiku --allowedTools "Read" --add-dir /tmp 2>&1) || true
-
-    if [[ -z "$RESPONSE" ]]; then
-        notify-send -i dialog-error "Claude Screenshot" "Pas de réponse de Claude"
-        exit 1
-    fi
-
-    echo -n "$RESPONSE" | wl-copy
-
-    zenity --text-info \
-        --title="Claude Screenshot - Résultat (copié)" \
-        --width=700 --height=500 --font="monospace" \
-        <<< "$RESPONSE" 2>/dev/null || true
-
-elif [[ "$ACTION" == send:* ]]; then
-    DEVICE="${ACTION#send:}"
-    DEST="$DEVICE:~/Downloads/$HOSTNAME/"
-
-    notify-send -i dialog-information "Claude Screenshot" "Envoi à $DEVICE..."
-
-    ssh "$DEVICE" "mkdir -p ~/Downloads/$HOSTNAME" && scp "$TMPFILE" "$DEST"
-    if [[ $? -eq 0 ]]; then
-        notify-send -i dialog-information "Claude Screenshot" "Envoyé à $DEVICE :~/Downloads/$HOSTNAME/"
-    else
-        notify-send -i dialog-error "Claude Screenshot" "Échec envoi à $DEVICE"
-    fi
-fi
+case "$ACTION" in
+    claude)
+        PROMPT=$(zenity --entry \
+            --title="Claude Screenshot" \
+            --text="Prompt:" \
+            --entry-text="$DEFAULT_PROMPT" \
+            --width=500 2>/dev/null) || true
+        send_to_claude "${PROMPT:-$DEFAULT_PROMPT}"
+        ;;
+    send:*)
+        send_to_device "${ACTION#send:}"
+        ;;
+esac
