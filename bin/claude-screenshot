@@ -60,8 +60,14 @@ send_to_device() {
 
     notify-send -i dialog-information "Claude Screenshot" "Sending to $device..."
 
+    # Resolve ~ to actual home on remote
+    local remote_home
+    remote_home=$(ssh "$device" 'echo $HOME') || remote_home="~"
+    local abs_path="$remote_home/Downloads/$LOCAL_HOSTNAME/$filename"
+
     if ssh "$device" "mkdir -p $dest_dir" && scp -q "$TMPFILE" "$device:$dest_dir/$filename"; then
-        notify-send -i dialog-information "Claude Screenshot" "Sent to $device:$dest_dir/$filename"
+        echo -n "$abs_path" | wl-copy
+        notify-send -i dialog-information "Claude Screenshot" "Sent to $device — path copied"
     else
         die "Failed to send to $device"
     fi
